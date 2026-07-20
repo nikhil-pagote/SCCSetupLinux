@@ -1,0 +1,17 @@
+Package: scc-lcd-daemon
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Nikhil Pagote <nikhil.pagote@gmail.com>
+Depends: pciutils
+Recommends: wireplumber
+Description: Front-panel LCD driver for Minisforum/AtomMan mini PCs
+ Linux replacement for the Windows-only SCC front-panel LCD driver.
+ Streams live CPU, GPU, memory, SSD, fan RPM and network transfer rates
+ to the case's front status display, and applies volume changes made from
+ the panel's own touch control.
+ .
+ Runs as a system service under root, which is required to read fan RPM
+ and the CPU/GPU temperatures from the vendor embedded controller via
+ direct port I/O, and to open the i915 perf PMU for GPU utilisation.

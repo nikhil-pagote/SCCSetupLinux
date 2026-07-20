@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+# versions 1.2.x shipped this as a per-user service; remove that first
+TARGET_USER="${SUDO_USER:-}"
+[ -z "$TARGET_USER" ] && TARGET_USER=$(logname 2>/dev/null || true)
+if [ -n "$TARGET_USER" ] && id "$TARGET_USER" >/dev/null 2>&1; then
+    TARGET_UID=$(id -u "$TARGET_USER")
+    runuser -l "$TARGET_USER" -c "XDG_RUNTIME_DIR=/run/user/${TARGET_UID} systemctl --user disable --now sccs-lcd.service" >/dev/null 2>&1 || true
+fi
+udevadm control --reload-rules
+udevadm trigger
+systemctl daemon-reload
+systemctl enable --now sccs-lcd.service
+exit 0

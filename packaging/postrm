@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+udevadm control --reload-rules
+udevadm trigger
+systemctl daemon-reload || true
+exit 0

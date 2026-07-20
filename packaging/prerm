@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+systemctl stop sccs-lcd.service || true
+systemctl disable sccs-lcd.service || true
+exit 0

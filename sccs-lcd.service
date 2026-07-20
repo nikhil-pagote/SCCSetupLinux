@@ -1,0 +1,13 @@
+[Unit]
+Description=SCC front-panel LCD daemon
+After=multi-user.target
+
+[Service]
+# Runs as root: fan RPM is read from the vendor embedded controller through
+# direct port I/O on /dev/port, which needs CAP_SYS_RAWIO.
+ExecStart=/usr/bin/scc-lcd-daemon
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
