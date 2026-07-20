@@ -15,11 +15,12 @@ For how the code actually works internally, see [ARCHITECTURE.md](ARCHITECTURE.m
 - `pciutils` (`lspci`) at runtime — used to detect the GPU name.
 - `wireplumber` (`wpctl`) at runtime — used to read/set system volume.
 
-The panel itself must be attached (USB-CDC device, VID `0416` PID `50a1`).
+Building and `--dump` work on any machine; actually driving a display needs
+the panel attached (USB-CDC device, VID `0416` PID `50a1`).
 
 ## Compiling
 
-From the `scc-lcd-daemon` directory:
+From the repository root:
 
 ```bash
 cargo build --release          # binary at target/release/scc-lcd-daemon
@@ -48,10 +49,15 @@ bash tools/build-deb.sh
 ```
 
 This builds the release binary, runs the test suite (it refuses to package
-a build with failing tests), and produces
-`scc-lcd-daemon_<version>_amd64.deb` one directory up from `scc-lcd-daemon/`
-(i.e. in the repo root). The version comes from `Cargo.toml` — bump it there
-before building a new release.
+a build with failing tests), and writes
+`scc-lcd-daemon_<version>_amd64.deb` to the **parent directory of this repo**
+— deliberately outside the working tree, so build output never gets
+committed. The version comes from `Cargo.toml` — bump it there before
+building a new release.
+
+Prebuilt packages are also attached to the
+[GitHub releases](https://github.com/nikhil-pagote/SCCSetupLinux/releases)
+if you'd rather not build from source.
 
 ## Installing
 

@@ -3,9 +3,9 @@
 This is a walkthrough of the codebase for anyone who hasn't read it before —
 what each part does and why, in the order you'd want to understand it rather
 than the order it appears in the file. For protocol/register-level reference
-(exact command bytes, EC addresses, sensor sources), see the `panel-protocol`
-skill under `.claude/skills/panel-protocol/SKILL.md` — this document explains
-the *code*; that one is the spec it was built from.
+(exact command bytes, EC addresses, unit conventions), the header comment at
+the top of `src/main.rs` is the in-repo spec — this document explains the
+*code*, that comment records the wire format it implements.
 
 The whole daemon is one file: `src/main.rs` (~1100 lines including tests).
 There was no reason to split it up — it's one loop with a handful of data
@@ -15,9 +15,10 @@ sources feeding it.
 
 The AtomMan X7 Ti's front-panel LCD (CPU/GPU/RAM/SSD/fan/network stats, touch
 volume slider) only worked with a Windows app (`SCCSetup.exe`, actually
-`app/SCCS.exe` once installed — reference copy kept in this repo, never run).
-This daemon replaces that app: same wire protocol, same registers, running
-natively on Linux.
+`app/SCCS.exe` once installed). This daemon replaces that app: same wire
+protocol, same registers, running natively on Linux. The vendor installer
+itself is not redistributed here — it was used only as a reference during
+reverse engineering, never executed.
 
 ## Big picture
 
@@ -51,14 +52,14 @@ receives a packet, poll or no poll.
 
 ### Serial transport (`find_port`, `open_port`)
 
-`find_port()` picks `/dev/sccs-lcd` if the udev rule created it, falls back to
-`/dev/ttyACM0`, or honors `SCC_LCD_PORT` for pointing at a pty in development
-(see the `hardware-probe` skill for that workflow).
+`find_port()` honors `SCC_LCD_PORT` if set (pointing at a pty instead of the
+panel, for development), otherwise picks `/dev/sccs-lcd` if the udev rule
+created it and falls back to `/dev/ttyACM0`.
 
 `open_port()` opens it and puts the tty into raw mode (no line discipline —
 we want bytes exactly as sent/received) at 115200 8N1, then raises DTR/RTS.
-Baud is irrelevant electrically since USB-CDC ignores it, but the panel's
-firmware watches DTR/RTS as a "host is present" signal.
+The baud rate is nominal: this is a USB-CDC device, so the line settings
+aren't driving a real UART.
 
 ### Framing — the two directions are NOT symmetric
 
@@ -178,8 +179,8 @@ hwmon value and fan RPM falls back to the last accepted value, matching what
 the original Windows app does.
 
 Without root, `Ec::open()` fails to open `/dev/port` and everything EC-backed
-just reports 0 — no crash, just degraded data (see `CLAUDE.md`'s "runs as
-root" note for why root is unavoidable here).
+falls back to its non-EC source or 0 — no crash, just degraded data. This is
+why the service runs as root rather than under a dedicated unprivileged user.
 
 ### GPU utilisation (`GpuBusy`)
 
@@ -191,7 +192,7 @@ video decode, etc.). `percent()` diffs each counter against the previous
 sample, divides by wall-clock elapsed time, and reports the **busiest single
 engine** — so a video call showing up on the decode engine reads as GPU
 activity just as readily as a 3D workload would. This is a known simplifying
-choice, not a blended/weighted figure (see Known gaps in `CLAUDE.md`).
+choice, not a blended/weighted figure across engines.
 
 ### Root disk resolution (`root_blockdev`)
 
@@ -230,13 +231,14 @@ parsing/formatting logic (framing, `/proc` parsing, rate formatting, sanity
 thresholds) that doesn't touch hardware. Run with:
 
 ```bash
-cargo test --manifest-path scc-lcd-daemon/Cargo.toml
+cargo test
 ```
 
 Things that genuinely need the physical panel or EC (does the fan reading
 match reality, does the panel's slider move) are out of reach for automated
-tests and are called out in `CLAUDE.md` as "verification is mostly manual" —
-see the `hardware-probe` skill for how to test against real hardware safely.
+tests — verification for those is manual, by looking at the panel. Most
+fields cannot be read back from the device, so "it compiled and sent" is not
+evidence a change worked.
 
 ## Packaging, install, and the systemd/udev pieces
 
@@ -244,7 +246,8 @@ see the `hardware-probe` skill for how to test against real hardware safely.
   (`0416:50a1`), makes the device world-writable (`0666`) and symlinks it to
   `/dev/sccs-lcd` so the daemon doesn't depend on enumeration order.
 - **`sccs-lcd.service`**: a *system* (not per-user) systemd unit — it must run
-  as root for `/dev/port` and the PMU, restarts on failure after 2s.
+  as root for `/dev/port` and the PMU. `Restart=always` with `RestartSec=2`,
+  so it comes back 2s after any exit, clean or not.
 - **`packaging/control.in`**: the `.deb` control file template;
   `tools/build-deb.sh` substitutes `@VERSION@` from `Cargo.toml` so the
   version has exactly one source of truth.
@@ -257,19 +260,35 @@ see the `hardware-probe` skill for how to test against real hardware safely.
 - **`tools/build-deb.sh`**: builds the release binary, runs the test suite
   (a release build that fails tests never gets packaged), stages a `pkg/`
   tree, and calls `fakeroot dpkg-deb --build` to produce
-  `scc-lcd-daemon_<version>_amd64.deb` in the repo root.
+  `scc-lcd-daemon_<version>_amd64.deb` in the **parent directory of this
+  repo** — deliberately outside it, so build output is never committed.
 
 Install is always interactive since `apt install` needs sudo:
 `sudo apt install --reinstall scc-lcd-daemon_<ver>_amd64.deb`.
 
-## Where to go next
+## Gotchas that have already cost real time
 
-- **Changing what's sent/read, or debugging a wrong-looking field**: read
-  `.claude/skills/panel-protocol/SKILL.md` first — it's the authoritative
-  register/format map this code implements.
-- **Testing against real hardware**: `.claude/skills/hardware-probe`.
-- **Building/releasing**: `.claude/skills/build-release`.
-- **Gotchas that have already cost time once** (EC vs ACPI EC, kHz vs MHz,
-  `stat()` not identifying the root disk, panel name-latching): see the
-  "Gotchas" section of `/home/nikhil/Documents/SCCSetupLinuxV1.7.0/CLAUDE.md` — this
-  document explains the code, that one is the hard-won list of traps.
+These are the traps that are easy to fall into when changing this code:
+
+- **Two EC interfaces exist.** The kernel's ACPI EC is `0x62`/`0x66`; the
+  vendor EC is `0x68`/`0x6c`. Reading via `ec_sys` returns zeros — that means
+  you're on the wrong EC, not that the data is missing.
+- **Inbound and outbound framing differ** — one-byte length from the device,
+  two-byte to it.
+- **`Freq` is kHz**, not MHz. Sending MHz renders as `0.0GHz`.
+- **`stat()` cannot identify the root disk** — btrfs/LVM/ZFS report an
+  anonymous `st_dev` with major 0. Resolve through `/proc/mounts`.
+- **The panel latches names at power-up**; changing them needs a power cycle,
+  not just a service restart.
+- **Verification is mostly manual.** Most fields cannot be read back from the
+  panel, so confirm a change by looking at the display.
+- **The sanity thresholds and odd unit conventions are deliberate** — they're
+  copied from the vendor app. Check the `src/main.rs` header comment before
+  "fixing" something that looks wrong.
+
+## Known gaps
+
+- The `0x62` (`'b'`) inbound command from the panel is unidentified.
+- The `{Ver;Name}` (`0x31`) identify packet changes nothing observable, so
+  the daemon doesn't send it.
+- GPU usage is the busiest single engine, not a blended figure.
