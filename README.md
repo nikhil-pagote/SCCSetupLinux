@@ -1,9 +1,9 @@
 # scc-lcd-daemon
 
 Linux replacement for the Windows-only front-panel LCD driver on the
-Minisforum AtomMan X7 Ti. Streams live CPU/GPU/RAM/SSD/fan/network stats to
-the case's front status display and applies volume changes made from the
-panel's own touch control.
+Minisforum AtomMan X7 Ti. Streams live CPU/GPU/RAM/SSD/fan/network stats — plus
+weather — to the case's front status display, and handles the panel's touch
+controls: volume, and the Energy-saving / Balanced / Performance mode button.
 
 For how the code actually works internally, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -14,6 +14,10 @@ For how the code actually works internally, see [ARCHITECTURE.md](ARCHITECTURE.m
 - `fakeroot` and `dpkg-deb` — only needed to build the `.deb` package.
 - `pciutils` (`lspci`) at runtime — used to detect the GPU name.
 - `wireplumber` (`wpctl`) at runtime — used to read/set system volume.
+- `curl` at runtime — used to fetch weather; optional, weather is simply off
+  without it.
+- `nvidia-smi` (NVIDIA) or the `amdgpu` driver (AMD) — only if you drive a
+  discrete/eGPU; the built-in Intel Arc iGPU needs neither.
 
 Building and `--dump` work on any machine; actually driving a display needs
 the panel attached (USB-CDC device, VID `0416` PID `50a1`).
@@ -144,7 +148,19 @@ SCC_LCD_PORT=/dev/pts/4 sudo -E target/release/scc-lcd-daemon
 
 Touch volume control on the panel works automatically once the service is
 running — no configuration needed; it detects the logged-in desktop
-session's PipeWire socket on its own.
+session's PipeWire socket on its own. The panel's **Mode Adjustment** button
+(Energy saving / Balanced / Performance) also works out of the box: the daemon
+applies the chosen mode to the hardware via the vendor EC.
+
+**Weather** appears on the date tile automatically, auto-located from the
+machine's public IP. To pin a location or turn it off, edit
+`/etc/default/scc-lcd`:
+
+```bash
+#OW_LOCATION=off          # disable weather (no external calls)
+#OW_LOCATION=denver,us    # a specific city
+#OW_LOCATION=19.07,72.87  # exact lat,lon
+```
 
 Note: the panel's on-screen name fields (CPU/GPU/disk name) latch to
 whatever they first receive after power-up. If a name looks wrong right

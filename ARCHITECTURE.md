@@ -7,18 +7,19 @@ than the order it appears in the file. For protocol/register-level reference
 the top of `src/main.rs` is the in-repo spec — this document explains the
 *code*, that comment records the wire format it implements.
 
-The whole daemon is one file: `src/main.rs` (~1100 lines including tests).
+The whole daemon is one file: `src/main.rs` (~1600 lines including tests).
 There was no reason to split it up — it's one loop with a handful of data
 sources feeding it.
 
 ## The problem it solves
 
-The AtomMan X7 Ti's front-panel LCD (CPU/GPU/RAM/SSD/fan/network stats, touch
-volume slider) only worked with a Windows app (`SCCSetup.exe`, actually
-`app/SCCS.exe` once installed). This daemon replaces that app: same wire
-protocol, same registers, running natively on Linux. The vendor installer
-itself is not redistributed here — it was used only as a reference during
-reverse engineering, never executed.
+The AtomMan X7 Ti's front-panel LCD (CPU/GPU/RAM/SSD/fan/network stats, weather,
+touch volume slider, and an Energy-saving/Balanced/Performance mode button) only
+worked with a Windows app (`SCCSetup.exe`, actually `app/SCCS.exe` once
+installed). This daemon replaces that app: same wire protocol, same registers,
+running natively on Linux. The vendor installer itself is not redistributed
+here — it was used only as a reference during reverse engineering, never
+executed.
 
 ## Big picture
 
@@ -31,14 +32,14 @@ reverse engineering, never executed.
 │       │                  (pump() drains panel input between  │
 │       ▼                   each write so a volume drag lands  │
 │  /proc, /sys,              promptly)                          │
-│  vendor EC,                                                   │
-│  i915 PMU,                                                    │
-│  wpctl                                                        │
+│  vendor EC, i915 PMU,                                         │
+│  nvidia-smi / amdgpu,                                         │
+│  wpctl, curl (weather)                                        │
 └─────────────────────────────────────────────────────────────┘
               ▲                                    │
               │                                    ▼
       panel polls host for              panel sends touch commands
-      each field (ignored —              (currently just volume)
+      each field (ignored —              (volume + performance mode)
       we push on our own schedule)       back over the same serial link
 ```
 
@@ -91,8 +92,8 @@ sheared at any boundary (partial reads, corrupted bytes):
 
 One-byte bodies are routine polls ("send me CPU data") and are dropped —
 the daemon already pushes that data on its own schedule. Two-or-more-byte
-bodies are actual commands from the panel's touch UI; today that's just
-`0x61` (volume, 0-100).
+bodies are actual commands from the panel's touch UI: `0x61` (volume, 0-100)
+and `0x62` (performance mode, 1-3).
 
 ### The main loop (`main()`)
 
@@ -119,9 +120,10 @@ Two things worth noticing:
 - The final wait is computed as a deadline from `cycle_start`, not as a flat
   extra sleep — so the loop period stays ~1s regardless of how long writing
   and pumping took.
-- `pump()` only calls `wpctl` when the decoded volume value actually *changes*
-  from the last one applied — a slider drag emits many identical-ish frames
-  per second, and without that check each one would fork a process.
+- `pump()` acts only when a decoded value actually *changes* from the last one
+  applied: a volume slider drag emits many identical-ish frames per second
+  (each would otherwise fork a `wpctl` process), and a mode tap likewise
+  re-writes the EC only on a real change.
 
 If a write fails (panel unplugged, etc.), the fd is closed, `fd` is reset to
 `None`, and the top of the loop reopens it on the next iteration — no crash,
@@ -135,18 +137,19 @@ from a mix of sources:
 | stat | source | notes |
 |---|---|---|
 | CPU name | `/proc/cpuinfo` (once, at startup) | latched in `HostInfo` |
-| CPU temp | `coretemp` hwmon `temp1_input` | primary/fallback source |
+| CPU temp | first of `coretemp`/`k10temp`/`zenpower`/`cpu_thermal`/`acpitz` | fallback chain |
 | CPU temp (EC) | vendor EC reg `0x20` | preferred if within sanity range |
 | CPU usage | `/proc/stat`, two samples a cycle apart | `cpu_percent()` |
 | CPU freq | `scaling_cur_freq` | **kHz**, sent unmodified — panel divides by 1e6 |
-| GPU name | `lspci -d ::0300` (once, at startup) | parses the PCI ID string |
-| GPU temp | vendor EC reg `0x22` | genuinely separate sensor from CPU |
-| GPU usage | i915 perf PMU, busiest engine | see `GpuBusy` below |
+| GPU name | `GpuBackend` (nvidia-smi / amdgpu / lspci, once) | discrete preferred over iGPU |
+| GPU temp | Intel: vendor EC `0x22`; discrete: its own driver | see `GpuBackend` below |
+| GPU usage | Intel: i915 PMU busiest engine; NVIDIA/AMD: driver | see `GpuBackend` below |
 | Memory | `/proc/meminfo` | `Used = Total - Available`, not `Total - Free` |
 | Disk name/model | `/sys/block/<dev>/device/model` (once) | via `root_blockdev()` |
 | Disk usage | `statvfs("/")` | |
-| Disk temp | nvme hwmon matched by canonical device path | `nvme_temp_c()` |
+| Disk temp | `nvme` hwmon, then `drivetemp`, by canonical path | `disk_temp_c()` |
 | Date/time | `libc::localtime_r` | local time, Win32-style Week field |
+| Weather | Open-Meteo via `curl` (see below) | optional; on the date tile |
 | Fan RPM | vendor EC reg `0x18`/`0x19` | sanity-checked, else reuses last good |
 | Network rates | `/proc/net/dev`, physical interfaces only | delta over elapsed time |
 | Volume | `wpctl get-volume` | reported back so the panel's slider stays in sync |
@@ -157,8 +160,8 @@ cycle — these never change while the daemon runs, and the panel latches its
 
 `State` carries the small amount of data that must survive between cycles to
 compute deltas/rates: previous `/proc/stat` snapshot, previous network byte
-counters + timestamp, the last accepted fan RPM, and the `GpuBusy` PMU
-handle.
+counters + timestamp, the last accepted fan RPM, the selected `GpuBackend`, and
+the weather cache (last fetch + resolved location).
 
 ### Vendor embedded controller (`Ec`)
 
@@ -178,21 +181,34 @@ real hardware. On a rejected reading, temperature falls back to the coretemp
 hwmon value and fan RPM falls back to the last accepted value, matching what
 the original Windows app does.
 
+`Ec::set_mode()` is the one EC *write*: it applies the performance mode from the
+panel's "Mode Adjustment" button (command `0xDE`, data `1`/`2`/`3`), the same
+handshake in reverse. It moves the CPU RAPL power limits (~45/54/65 W long-term
+for Energy-saving/Balanced/Performance). The panel reports its current mode on
+connect, so a restart re-applies it.
+
 Without root, `Ec::open()` fails to open `/dev/port` and everything EC-backed
-falls back to its non-EC source or 0 — no crash, just degraded data. This is
-why the service runs as root rather than under a dedicated unprivileged user.
+falls back to its non-EC source or 0 — no crash, just degraded data (mode taps
+are silently ignored too). This is why the service runs as root rather than
+under a dedicated unprivileged user.
 
-### GPU utilisation (`GpuBusy`)
+### GPU utilisation (`GpuBackend`)
 
-The i915 driver exposes per-engine "busy" counters (nanoseconds the engine
-was active) as perf PMU events under `/sys/devices/i915/events/*-busy` — the
-same interface `intel_gpu_top` uses. `GpuBusy::open()` opens a raw
-`perf_event_open` counting-event fd for every `*-busy` event it finds (3D,
-video decode, etc.). `percent()` diffs each counter against the previous
-sample, divides by wall-clock elapsed time, and reports the **busiest single
-engine** — so a video call showing up on the decode engine reads as GPU
-activity just as readily as a 3D workload would. This is a known simplifying
-choice, not a blended/weighted figure across engines.
+`GpuBackend::detect()` picks one GPU at startup: a working NVIDIA card
+(`nvidia-smi`) or an AMD `amdgpu` card is preferred over the Intel iGPU, so an
+Oculink eGPU is reported instead of the integrated graphics. NVIDIA temp/usage
+come from `nvidia-smi`, AMD from `amdgpu` sysfs (`gpu_busy_percent` + hwmon).
+
+The Intel path (`GpuBusy`) uses the i915 driver's per-engine "busy" counters
+(nanoseconds the engine was active), exposed as perf PMU events under
+`/sys/devices/i915/events/*-busy` — the same interface `intel_gpu_top` uses.
+`GpuBusy::open()` opens a raw `perf_event_open` counting-event fd for every
+`*-busy` event it finds (3D, video decode, etc.). `percent()` diffs each counter
+against the previous sample, divides by wall-clock elapsed time, and reports the
+**busiest single engine** — so a video call on the decode engine reads as GPU
+activity just as readily as a 3D workload. This is a known simplifying choice,
+not a blended/weighted figure across engines. (For the Intel iGPU, temperature
+still comes from the vendor EC reg `0x22`, not the PMU.)
 
 ### Root disk resolution (`root_blockdev`)
 
@@ -214,6 +230,17 @@ has a live `pipewire-0` socket and uses that, rather than hardcoding a
 username, so the same `.deb` works on any machine/user. `wpctl()` then runs
 with that UID and its `XDG_RUNTIME_DIR` set, calling `wpctl set-volume` /
 `get-volume` on `@DEFAULT_AUDIO_SINK@`.
+
+### Weather (`WeatherState`)
+
+The date tile can carry weather. `WeatherState` reads `OW_LOCATION` (unset =
+auto-locate by public IP via ip-api.com; `off` = disabled; otherwise a `lat,lon`
+pair or a city name geocoded through Open-Meteo). The forecast comes from
+Open-Meteo (free, keyless) by shelling out to `curl`, cached for
+`ATOMMAN_WEATHER_REFRESH` seconds (default 600) and throttled even on failure so
+a broken network doesn't spawn `curl` every cycle. WMO weather codes are mapped
+to the panel's own icon codes (1-40, with day/night variants) by `wmo_to_panel`.
+Everything degrades to no weather (empty fields) if `curl`/network/parse fails.
 
 ### `--dump`
 
@@ -288,7 +315,9 @@ These are the traps that are easy to fall into when changing this code:
 
 ## Known gaps
 
-- The `0x62` (`'b'`) inbound command from the panel is unidentified.
 - The `{Ver;Name}` (`0x31`) identify packet changes nothing observable, so
   the daemon doesn't send it.
 - GPU usage is the busiest single engine, not a blended figure.
+- Face/theme switching (swipe up for the clock view, left/right to cycle faces)
+  is entirely panel-internal — there is no host command for it, so the daemon
+  can neither drive nor read it. It works on Linux exactly as on Windows.
