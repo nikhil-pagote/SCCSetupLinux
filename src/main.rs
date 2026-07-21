@@ -50,10 +50,6 @@ use std::time::{Duration, Instant};
 
 const PORT_CANDIDATES: [&str; 2] = ["/dev/sccs-lcd", "/dev/ttyACM0"];
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
-// The panel polls the host continuously, so inbound bytes are a liveness
-// signal. If none arrive for this long the link is dead (suspend/resume, USB
-// re-enumeration) even without a write error, so reopen the port.
-const LINK_SILENCE: Duration = Duration::from_secs(15);
 
 // hwmon "name" values that expose a CPU package temperature, in preference
 // order: Intel, then AMD (k10temp/zenpower), then generic ARM/ACPI sources.
@@ -73,6 +69,12 @@ const CMD_VOLUME: u8 = 0x39;
 // send that data type; a longer body is a control command from its touch UI.
 const FRAME_TRAILER: [u8; 4] = [0xCC, 0x33, 0xC3, 0x3C];
 const DEV_CMD_VOLUME: u8 = 0x61; // 'a', payload is volume 0-100
+// 'b', the panel's "Mode Adjustment" button. Payload 1/2/3 =
+// Energy-saving/Balanced/Performance; the vendor app applies it by writing the
+// EC (see Ec::set_mode). Values confirmed by capture on hardware.
+const DEV_CMD_MODE: u8 = 0x62;
+const MODE_MIN: u8 = 1;
+const MODE_MAX: u8 = 3;
 
 const DISK_MOUNT: &str = "/";
 
@@ -85,6 +87,7 @@ const EC_PORT_CMD: u64 = 0x6C; // status/command port
 const EC_PORT_DATA: u64 = 0x68;
 const EC_CMD_FAN: u8 = 0xD5; // read command used for the fan registers
 const EC_CMD_TEMP: u8 = 0xDD; // read command used for the temperature registers
+const EC_CMD_MODE: u8 = 0xDE; // WRITE command that applies the performance mode
 const EC_REG_FAN_HI: u8 = 0x19;
 const EC_REG_FAN_LO: u8 = 0x18;
 const EC_REG_CPU_TEMP: u8 = 0x20;
@@ -627,6 +630,17 @@ impl Ec {
         self.outb(EC_PORT_DATA, addr);
         self.wait_status(0x01, true); // output buffer full
         self.inb(EC_PORT_DATA)
+    }
+
+    /// Apply a performance mode (1=Energy saving, 2=Balanced, 3=Performance) by
+    /// writing the EC exactly as the vendor app does: the mode command followed
+    /// by the value, with no read-back. Verified on hardware to move the CPU
+    /// RAPL power limits (e.g. 45/54/65 W long-term for modes 1/2/3).
+    fn set_mode(&self, value: u8) {
+        self.wait_status(0x02, false); // input buffer empty
+        self.outb(EC_PORT_CMD, EC_CMD_MODE);
+        self.wait_status(0x02, false);
+        self.outb(EC_PORT_DATA, value);
     }
 
     fn fan_rpm(&self) -> i64 {
@@ -1377,31 +1391,43 @@ fn main() {
     let mut fd: Option<RawFd> = None;
     let mut input: Vec<u8> = Vec::new();
     let mut last_volume: Option<u8> = None;
+    let mut last_mode: Option<u8> = None;
+    let ec_ref = ec.as_ref();
 
     // Drain whatever the panel has sent and act on its touch commands. Called
-    // between writes so a volume drag is applied without waiting a full cycle.
-    // A drag emits many frames, so only act when the value actually changes --
-    // otherwise every frame would fork a wpctl process.
-    // Returns true if any bytes arrived, which the caller uses as a liveness
-    // signal for the link.
-    let pump = |fd: RawFd, input: &mut Vec<u8>, last: &mut Option<u8>| -> bool {
-        let bytes = read_available(fd);
-        let got = !bytes.is_empty();
-        input.extend_from_slice(&bytes);
+    // between writes so a volume drag or a mode tap is applied without waiting a
+    // full cycle. A drag emits many frames, so only act when the value actually
+    // changes -- otherwise every frame would fork a wpctl process (volume) or
+    // re-poke the EC (mode).
+    let pump = |fd: RawFd, input: &mut Vec<u8>, last_vol: &mut Option<u8>, last_mode: &mut Option<u8>| {
+        input.extend_from_slice(&read_available(fd));
         for (cmd, values) in parse_device_frames(input) {
-            if cmd == DEV_CMD_VOLUME {
-                if let Some(&v) = values.first() {
-                    if *last != Some(v) {
-                        *last = Some(v);
-                        set_system_volume(v);
+            match cmd {
+                DEV_CMD_VOLUME => {
+                    if let Some(&v) = values.first() {
+                        if *last_vol != Some(v) {
+                            *last_vol = Some(v);
+                            set_system_volume(v);
+                        }
                     }
                 }
+                // The "Mode Adjustment" button; apply the performance mode via
+                // the EC (needs root). Ignored without the EC, like the temps.
+                DEV_CMD_MODE => {
+                    if let Some(&m) = values.first() {
+                        if (MODE_MIN..=MODE_MAX).contains(&m) && *last_mode != Some(m) {
+                            *last_mode = Some(m);
+                            if let Some(e) = ec_ref {
+                                e.set_mode(m);
+                                eprintln!("performance mode set to {m}");
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        got
     };
-
-    let mut last_rx = Instant::now();
 
     loop {
         if fd.is_none() {
@@ -1410,7 +1436,6 @@ fn main() {
                     Ok(f) => {
                         fd = Some(f);
                         input.clear();
-                        last_rx = Instant::now();
                     }
                     Err(e) => {
                         eprintln!("failed to open {path}: {e}");
@@ -1437,9 +1462,7 @@ fn main() {
                 broke = true;
                 break;
             }
-            if pump(fd.unwrap(), &mut input, &mut last_volume) {
-                last_rx = Instant::now();
-            }
+            pump(fd.unwrap(), &mut input, &mut last_volume, &mut last_mode);
             std::thread::sleep(Duration::from_millis(20));
         }
         if broke {
@@ -1447,22 +1470,15 @@ fn main() {
             continue;
         }
 
-        // Service input for the remainder of the cycle, so the whole loop
-        // lands on UPDATE_INTERVAL rather than interval + time already spent.
-        // A healthy panel polls constantly; prolonged silence means the link
-        // died without a write error (suspend/resume, USB re-enumeration), so
-        // reopen the port.
+        // Service input for the remainder of the cycle, so the whole loop lands
+        // on UPDATE_INTERVAL rather than interval + time already spent. The
+        // panel legitimately goes quiet on non-stats screens (mode menu, clock
+        // face), so silence is not treated as a dead link -- a failed write is
+        // the reliable disconnect signal, handled above.
         let deadline = cycle_start + UPDATE_INTERVAL;
         while Instant::now() < deadline {
-            if pump(fd.unwrap(), &mut input, &mut last_volume) {
-                last_rx = Instant::now();
-            }
+            pump(fd.unwrap(), &mut input, &mut last_volume, &mut last_mode);
             std::thread::sleep(Duration::from_millis(25));
-        }
-        if last_rx.elapsed() > LINK_SILENCE {
-            eprintln!("no panel traffic for {}s -- reopening port", LINK_SILENCE.as_secs());
-            unsafe { libc::close(fd.unwrap()) };
-            fd = None;
         }
     }
 }
@@ -1521,6 +1537,15 @@ mod tests {
             let mut buf = volume_frame(level);
             let got = parse_device_frames(&mut buf);
             assert_eq!(got, vec![(DEV_CMD_VOLUME, vec![level])], "level {level}");
+        }
+    }
+
+    #[test]
+    fn mode_command_is_decoded() {
+        // "Mode Adjustment": AA 06 62 <1|2|3> CC 33 C3 3C, captured on hardware.
+        for m in [MODE_MIN, 2, MODE_MAX] {
+            let mut buf = vec![0xAA, 0x06, DEV_CMD_MODE, m, 0xCC, 0x33, 0xC3, 0x3C];
+            assert_eq!(parse_device_frames(&mut buf), vec![(DEV_CMD_MODE, vec![m])], "mode {m}");
         }
     }
 

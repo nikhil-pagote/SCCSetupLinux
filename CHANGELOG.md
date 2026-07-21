@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 semantic versioning. The version is the single source of truth in `Cargo.toml`.
 
+## [1.9.0] - 2026-07-21
+
+### Added
+- **Performance-mode button.** The panel's "Mode Adjustment" button
+  (Energy saving / Balanced / Performance) now works: the daemon applies the
+  selected mode via the vendor EC (`0xDE`→`0x68`, values 1/2/3), verified on
+  hardware to move the CPU RAPL power limits (~45/54/65 W long-term). The panel
+  reports its current mode on connect, so a daemon restart re-applies it.
+
+### Removed
+- **Link-silence reconnect** (added in 1.8.0). It misfired whenever the panel
+  sat on a non-stats screen (mode menu, clock face) — normal use — repeatedly
+  reopening the port. Genuine disconnects are already covered by the
+  write-error reconnect, so silence is no longer treated as a dead link.
+
 ## [1.8.0] - 2026-07-21
 
 ### Added
@@ -37,5 +52,6 @@ semantic versioning. The version is the single source of truth in `Cargo.toml`.
   rates to the front panel, and applies volume changes from its touch control.
   Packaged as a `.deb` with a systemd unit and udev rule.
 
+[1.9.0]: https://github.com/nikhil-pagote/SCCSetupLinux/releases/tag/v1.9.0
 [1.8.0]: https://github.com/nikhil-pagote/SCCSetupLinux/releases/tag/v1.8.0
 [1.7.0]: https://github.com/nikhil-pagote/SCCSetupLinux/releases/tag/v1.7.0
