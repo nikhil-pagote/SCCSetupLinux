@@ -1,0 +1,14 @@
+# Configuration for the scc-lcd-daemon system service.
+# Edit, then: sudo systemctl restart sccs-lcd
+
+# Weather on the Date tile. By default (this setting unset) the daemon
+# auto-detects your city from the machine's public IP -- no config needed.
+# This sends your public IP to a geolocation service (ip-api.com).
+#
+#   OW_LOCATION=off          disable weather entirely (no external calls)
+#   OW_LOCATION=denver,us    a specific city (geocoded via Open-Meteo)
+#   OW_LOCATION=19.07,72.87  exact "lat,lon"
+#OW_LOCATION=off
+
+# How often to refresh weather, in seconds (default 600).
+#ATOMMAN_WEATHER_REFRESH=600

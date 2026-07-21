@@ -18,9 +18,12 @@
 //   0x33  GPU:    "{GPU:%s;Tempr:%d;Useage:%d}"
 //   0x34  Memory: "{Memory:%s;Used:%.1f;Available:%.1f;Total:%.1f;Useage:%d}"
 //   0x35  Disk:   "{DiskName:%s;Tempr:%d;UsageSpace:%d;AllSpace:%d;Usage:%d}"
-//   0x36  Date:   "Date:%02d/%02d/%02d;Time:%02d:%02d:%02d;Week:%d"
-//                 (fields are Year/Month/Day, i.e. YY/MM/DD, and Week is
-//                  0=Sunday..6=Saturday to match Win32 SYSTEMTIME)
+//   0x36  Date:   "{Date:YYYY/MM/DD;Time:HH:MM:SS;Week:%d;Weather:%d;
+//                   TemprLo:%d,TemprHi:%d,Zone:%s,Desc:%s}"
+//                 (Week is 0=Sunday..6=Saturday to match Win32 SYSTEMTIME; the
+//                  weather block is optional -- empty fields when unavailable.
+//                  The vendor app sent only Date/Time/Week with a 2-digit year
+//                  and no braces; the panel accepts both.)
 //   0x37  Speed:  "{SPEED:%d;NETWORK:%s,%s}"
 //                 (SPEED is fan RPM; the two strings are network transfer
 //                  rates formatted as "%.1fK/s" / "%.1fM/s" / "%.1fG/s")
@@ -47,6 +50,14 @@ use std::time::{Duration, Instant};
 
 const PORT_CANDIDATES: [&str; 2] = ["/dev/sccs-lcd", "/dev/ttyACM0"];
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+// The panel polls the host continuously, so inbound bytes are a liveness
+// signal. If none arrive for this long the link is dead (suspend/resume, USB
+// re-enumeration) even without a write error, so reopen the port.
+const LINK_SILENCE: Duration = Duration::from_secs(15);
+
+// hwmon "name" values that expose a CPU package temperature, in preference
+// order: Intel, then AMD (k10temp/zenpower), then generic ARM/ACPI sources.
+const CPU_TEMP_HWMON: [&str; 5] = ["coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz"];
 
 const CMD_CPU: u8 = 0x32;
 const CMD_GPU: u8 = 0x33;
@@ -334,6 +345,32 @@ fn disk_model(blockdev: &str) -> String {
         .unwrap_or_else(|| blockdev.to_string())
 }
 
+/// Human name from one `lspci -mm` line. Fields are quoted:
+/// slot "class" "vendor" "device" ...  Prefers the bracketed marketing name,
+/// e.g. "Meteor Lake-P [Intel Arc Graphics]" -> "Intel Arc Graphics".
+fn parse_lspci_device(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.split('"').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let vendor = parts[3];
+    let device = parts[5];
+    let short_vendor = vendor.split_whitespace().next().unwrap_or(vendor);
+    if let (Some(o), Some(c)) = (device.find('['), device.find(']')) {
+        if o < c {
+            return Some(device[o + 1..c].to_string());
+        }
+    }
+    Some(format!("{short_vendor} {device}"))
+}
+
+/// Name of the PCI device at `slot` (domain:bus:slot.func), via lspci.
+fn lspci_name(slot: &str) -> Option<String> {
+    let out = std::process::Command::new("lspci").args(["-mm", "-s", slot]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_lspci_device(text.lines().next()?)
+}
+
 /// GPU name from the DRM device's PCI ID, via the shared pci.ids database
 /// that lspci uses. Falls back to a generic label.
 fn gpu_name() -> String {
@@ -341,26 +378,121 @@ fn gpu_name() -> String {
         .args(["-mm", "-d", "::0300"]) // display controllers
         .output()
         .ok();
-    if let Some(out) = out {
-        let text = String::from_utf8_lossy(&out.stdout);
-        // fields are quoted: slot "class" "vendor" "device" ...
-        if let Some(line) = text.lines().next() {
-            let parts: Vec<&str> = line.split('"').collect();
-            if parts.len() >= 6 {
-                let vendor = parts[3];
-                let device = parts[5];
-                // "Intel Corporation" + "Meteor Lake-P [Intel Arc Graphics]"
-                let short_vendor = vendor.split_whitespace().next().unwrap_or(vendor);
-                if let (Some(o), Some(c)) = (device.find('['), device.find(']')) {
-                    if o < c {
-                        return device[o + 1..c].to_string();
-                    }
-                }
-                return format!("{short_vendor} {device}");
-            }
+    out.as_ref()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().and_then(parse_lspci_device))
+        .unwrap_or_else(|| "GPU".to_string())
+}
+
+/// Is a working NVIDIA GPU present? `nvidia-smi -L` lists "GPU 0: ..." lines
+/// when a card and driver are up; anything else (no driver, no card, error)
+/// means no NVIDIA path to use.
+fn nvidia_present() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GPU "))
+        .unwrap_or(false)
+}
+
+/// First line of `nvidia-smi --query-gpu=<fields>` in CSV (no header/units).
+fn nvidia_query(fields: &str) -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .arg(format!("--query-gpu={fields}"))
+        .arg("--format=csv,noheader,nounits")
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string())
+}
+
+fn nvidia_name() -> Option<String> {
+    nvidia_query("name").filter(|s| !s.is_empty())
+}
+
+fn parse_nvidia_temp_usage(line: &str) -> (i64, i64) {
+    let mut it = line.split(',').map(|s| s.trim().parse::<i64>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+fn nvidia_temp_usage() -> (i64, i64) {
+    nvidia_query("temperature.gpu,utilization.gpu")
+        .map(|l| parse_nvidia_temp_usage(&l))
+        .unwrap_or((0, 0))
+}
+
+/// A discrete AMD GPU exposed through the `amdgpu` driver. Temperature comes
+/// from its hwmon edge sensor and utilisation from the card's
+/// `gpu_busy_percent`, both standard sysfs -- no EC or PMU involved.
+struct AmdGpu {
+    hwmon: PathBuf,
+    device: PathBuf, // canonical PCI device dir (holds gpu_busy_percent)
+}
+
+impl AmdGpu {
+    fn detect() -> Option<AmdGpu> {
+        let hwmon = find_hwmon_by_name("amdgpu")?;
+        let device = fs::canonicalize(hwmon.join("device")).ok()?;
+        Some(AmdGpu { hwmon, device })
+    }
+
+    fn temp(&self) -> i64 {
+        read_temp_c(&self.hwmon, "temp1_input")
+    }
+
+    fn usage(&self) -> i64 {
+        fs::read_to_string(self.device.join("gpu_busy_percent"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn name(&self) -> String {
+        self.device
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(lspci_name)
+            .unwrap_or_else(|| "GPU".to_string())
+    }
+}
+
+/// Which GPU the daemon reports. Discrete cards (an Oculink eGPU) win over the
+/// Intel iGPU when present, so the panel shows the card actually doing work.
+/// Detected once at startup; a hotplugged eGPU needs a daemon restart (and the
+/// panel latches the name at power-up regardless).
+enum GpuBackend {
+    Intel(Option<GpuBusy>), // i915 PMU for usage; temperature from the vendor EC
+    Nvidia,
+    Amd(AmdGpu),
+}
+
+impl GpuBackend {
+    fn detect() -> GpuBackend {
+        if nvidia_present() {
+            return GpuBackend::Nvidia;
+        }
+        if let Some(a) = AmdGpu::detect() {
+            return GpuBackend::Amd(a);
+        }
+        GpuBackend::Intel(GpuBusy::open())
+    }
+
+    fn name(&self) -> String {
+        match self {
+            GpuBackend::Nvidia => nvidia_name().unwrap_or_else(|| "GPU".to_string()),
+            GpuBackend::Amd(a) => a.name(),
+            GpuBackend::Intel(_) => gpu_name(),
         }
     }
-    "GPU".to_string()
+
+    fn label(&self) -> &'static str {
+        match self {
+            GpuBackend::Nvidia => "nvidia (nvidia-smi)",
+            GpuBackend::Amd(_) => "amd (amdgpu sysfs)",
+            GpuBackend::Intel(Some(_)) => "intel (i915 PMU + EC)",
+            GpuBackend::Intel(None) => "intel (EC temp only; PMU unavailable)",
+        }
+    }
 }
 
 fn cpu_name() -> String {
@@ -640,9 +772,10 @@ fn format_rate(bytes_per_sec: f64) -> String {
     }
 }
 
-fn nvme_temp_c(blockdev: &str) -> i64 {
-    let dev_link = format!("/sys/block/{blockdev}/device");
-    let dev_real = match fs::canonicalize(&dev_link) {
+/// Temperature of the hwmon named `hwmon_name` whose backing device is the
+/// given block device, matched by canonical sysfs path. 0 if none.
+fn block_hwmon_temp(blockdev: &str, hwmon_name: &str) -> i64 {
+    let dev_real = match fs::canonicalize(format!("/sys/block/{blockdev}/device")) {
         Ok(p) => p,
         Err(_) => return 0,
     };
@@ -652,7 +785,7 @@ fn nvme_temp_c(blockdev: &str) -> i64 {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if fs::read_to_string(path.join("name")).map(|s| s.trim() == "nvme").unwrap_or(false) {
+        if fs::read_to_string(path.join("name")).map(|s| s.trim() == hwmon_name).unwrap_or(false) {
             if let Ok(hwmon_dev) = fs::canonicalize(path.join("device")) {
                 if hwmon_dev == dev_real {
                     return read_temp_c(&path, "temp1_input");
@@ -661,6 +794,15 @@ fn nvme_temp_c(blockdev: &str) -> i64 {
         }
     }
     0
+}
+
+/// Disk temperature: NVMe drives expose it through the `nvme` hwmon; SATA/USB
+/// drives through `drivetemp` (needs the drivetemp module loaded). 0 if neither.
+fn disk_temp_c(blockdev: &str) -> i64 {
+    match block_hwmon_temp(blockdev, "nvme") {
+        0 => block_hwmon_temp(blockdev, "drivetemp"),
+        t => t,
+    }
 }
 
 struct DateParts {
@@ -690,6 +832,345 @@ fn now_local() -> DateParts {
     }
 }
 
+// ---- weather -------------------------------------------------------------
+//
+// Date-tile weather, sent in the panel's braced Date payload (verified on the
+// panel). Forecast data comes from Open-Meteo (free, no API
+// key). Location follows OW_LOCATION:
+//   unset / empty  -> auto: geolocate by public IP (so the shared .deb needs no
+//                     per-machine config, matching this project's conventions)
+//   off/none       -> weather disabled
+//   "lat,lon"      -> used directly
+//   a city name    -> geocoded via Open-Meteo
+// ATOMMAN_WEATHER_REFRESH changes the 600s poll interval. Everything shells out
+// to curl and degrades to no weather (empty fields) if anything fails.
+//
+// Note auto mode sends the machine's public IP to a third-party geolocation
+// service (ip-api.com); OW_LOCATION=off avoids any such call.
+
+const WEATHER_REFRESH_DEFAULT: u64 = 600;
+
+struct Weather {
+    code: i64, // panel weather-icon code (1..40)
+    lo: i64,
+    hi: i64,
+    zone: String,
+    desc: String,
+}
+
+/// {Date:YYYY/MM/DD;Time:HH:MM:SS;Week:N;Weather:X;TemprLo:L,TemprHi:H,Zone:Z,Desc:D}
+/// The weather block is sent with empty values when unavailable, exactly as the
+/// reference driver does. Week is Sun=0..Sat=6 (libc tm_wday, sent unmodified).
+fn format_date_packet(d: &DateParts, w: Option<&Weather>) -> String {
+    let head = format!(
+        "{{Date:{:04}/{:02}/{:02};Time:{:02}:{:02}:{:02};Week:{}",
+        d.year, d.month, d.day, d.hour, d.minute, d.second, d.win_dow
+    );
+    match w {
+        Some(w) => format!(
+            "{head};Weather:{};TemprLo:{},TemprHi:{},Zone:{},Desc:{}}}",
+            w.code, w.lo, w.hi, w.zone, w.desc
+        ),
+        None => format!("{head};Weather:;TemprLo:,TemprHi:,Zone:,Desc:}}"),
+    }
+}
+
+struct Located {
+    lat: f64,
+    lon: f64,
+    zone: String,
+}
+
+enum LocMode {
+    Auto,           // geolocate by public IP
+    Off,            // weather disabled
+    Manual(String), // explicit "lat,lon" or a city name
+}
+
+struct WeatherState {
+    mode: LocMode,
+    refresh: Duration,
+    located: Option<Located>,
+    last: Option<Weather>,
+    fetched_at: Option<Instant>,
+}
+
+impl WeatherState {
+    fn from_env() -> WeatherState {
+        let mode = match std::env::var("OW_LOCATION") {
+            Err(_) => LocMode::Auto,
+            Ok(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    LocMode::Auto
+                } else if ["off", "none", "disabled"].iter().any(|k| s.eq_ignore_ascii_case(k)) {
+                    LocMode::Off
+                } else {
+                    LocMode::Manual(s.to_string())
+                }
+            }
+        };
+        let refresh = std::env::var("ATOMMAN_WEATHER_REFRESH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(WEATHER_REFRESH_DEFAULT);
+        WeatherState {
+            mode,
+            refresh: Duration::from_secs(refresh),
+            located: None,
+            last: None,
+            fetched_at: None,
+        }
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self.mode {
+            LocMode::Auto => "auto (IP geolocation)",
+            LocMode::Off => "off (OW_LOCATION=off)",
+            LocMode::Manual(_) => "manual (OW_LOCATION)",
+        }
+    }
+
+    /// Latest weather, refetched at most once per `refresh`. Resolves the
+    /// location lazily, retrying each refresh until it succeeds. Returns the
+    /// previous value between refreshes and None when disabled or never fetched.
+    fn current(&mut self) -> Option<&Weather> {
+        if matches!(self.mode, LocMode::Off) {
+            return None;
+        }
+        let stale = self.fetched_at.map(|t| t.elapsed() >= self.refresh).unwrap_or(true);
+        if stale {
+            if self.located.is_none() {
+                self.located = match &self.mode {
+                    LocMode::Off => None,
+                    LocMode::Auto => geolocate_ip(),
+                    LocMode::Manual(s) => geocode(s),
+                };
+            }
+            if let Some(loc) = &self.located {
+                if let Some(w) = fetch_open_meteo(loc) {
+                    self.last = Some(w);
+                }
+            }
+            // Throttle even on failure so a broken network doesn't spawn curl
+            // every cycle; the last good value keeps showing.
+            self.fetched_at = Some(Instant::now());
+        }
+        self.last.as_ref()
+    }
+}
+
+/// Approximate location from the machine's public IP via ip-api.com (keyless,
+/// HTTP). Used only in auto mode; sends the public IP to that service.
+fn geolocate_ip() -> Option<Located> {
+    parse_ipapi(&curl_get("http://ip-api.com/json/?fields=status,city,countryCode,lat,lon")?)
+}
+
+fn parse_ipapi(json: &str) -> Option<Located> {
+    if json_string(json, "\"status\":").as_deref() != Some("success") {
+        return None;
+    }
+    let lat = json_number(json, "\"lat\":")?;
+    let lon = json_number(json, "\"lon\":")?;
+    let city = json_string(json, "\"city\":").unwrap_or_default();
+    let cc = json_string(json, "\"countryCode\":").unwrap_or_default();
+    let zone = match (city.is_empty(), cc.is_empty()) {
+        (false, false) => format!("{city},{cc}"),
+        (false, true) => city,
+        _ => format!("{lat:.2},{lon:.2}"),
+    };
+    Some(Located { lat, lon, zone })
+}
+
+fn curl_get(url: &str) -> Option<String> {
+    let out = std::process::Command::new("curl")
+        .args(["-s", "--connect-timeout", "3", "--max-time", "5", url])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    (!body.is_empty()).then_some(body)
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Resolve OW_LOCATION to coordinates: a literal "lat,lon" is used directly,
+/// otherwise the leading name is geocoded via Open-Meteo's keyless API.
+fn geocode(spec: &str) -> Option<Located> {
+    if let Some((a, b)) = spec.split_once(',') {
+        if let (Ok(lat), Ok(lon)) = (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+            return Some(Located { lat, lon, zone: format!("{lat:.2},{lon:.2}") });
+        }
+    }
+    let name = spec.split(',').next().unwrap_or(spec).trim();
+    let url = format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
+        urlencode(name)
+    );
+    parse_geocode(&curl_get(&url)?)
+}
+
+fn parse_geocode(json: &str) -> Option<Located> {
+    let lat = json_number(json, "\"latitude\":")?;
+    let lon = json_number(json, "\"longitude\":")?;
+    let name = json_string(json, "\"name\":").unwrap_or_default();
+    let cc = json_string(json, "\"country_code\":").unwrap_or_default();
+    let zone = if cc.is_empty() { name } else { format!("{name},{cc}") };
+    Some(Located { lat, lon, zone })
+}
+
+fn fetch_open_meteo(loc: &Located) -> Option<Weather> {
+    let url = format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={:.6}&longitude={:.6}\
+         &current=temperature_2m,weather_code,is_day\
+         &daily=weather_code,temperature_2m_max,temperature_2m_min\
+         &timezone=auto&forecast_days=1",
+        loc.lat, loc.lon
+    );
+    parse_open_meteo(&curl_get(&url)?, &loc.zone)
+}
+
+/// Read the current conditions and today's min/max. The keys are looked up
+/// inside the `current`/`daily` objects specifically, because Open-Meteo emits
+/// `current_units`/`daily_units` blocks first whose string values (e.g.
+/// `"weather_code":"wmo code"`) would otherwise shadow the real numbers.
+fn parse_open_meteo(json: &str, zone: &str) -> Option<Weather> {
+    let current = json_object(json, "\"current\":")?;
+    let daily = json_object(json, "\"daily\":")?;
+    let code = json_number(current, "\"weather_code\":")? as i64;
+    let is_day = json_number(current, "\"is_day\":").unwrap_or(1.0) as i64 != 0;
+    let lo = json_array_first(daily, "\"temperature_2m_min\":")?;
+    let hi = json_array_first(daily, "\"temperature_2m_max\":")?;
+    Some(Weather {
+        code: wmo_to_panel(code, is_day),
+        lo: lo.round() as i64,
+        hi: hi.round() as i64,
+        zone: sanitize(zone),
+        desc: sanitize(wmo_desc(code)),
+    })
+}
+
+/// Keep payload-breaking bytes out of free-text fields: semicolons become
+/// commas and non-ASCII becomes '?', matching the reference driver.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == ';' { ',' } else if c.is_ascii() { c } else { '?' })
+        .collect()
+}
+
+/// Open-Meteo WMO weather code -> panel icon code (1..40), with day/night
+/// variants for clear and cloudy conditions. Unknown codes fall back to
+/// overcast (9).
+fn wmo_to_panel(code: i64, is_day: bool) -> i64 {
+    match code {
+        0 => if is_day { 1 } else { 3 },
+        1 => if is_day { 5 } else { 6 },
+        2 => if is_day { 7 } else { 8 },
+        3 => 9,
+        45 | 48 => 30,
+        51 | 53 | 55 => 13,
+        56 | 57 => 19,
+        61 => 13,
+        63 => 14,
+        65 => 15,
+        66 | 67 => 19,
+        71 => 22,
+        73 => 23,
+        75 => 24,
+        77 => 21,
+        80 | 81 => 10,
+        82 => 15,
+        85 | 86 => 24,
+        95 => 11,
+        96 | 99 => 16,
+        _ => 9,
+    }
+}
+
+/// Short description for a WMO code (Open-Meteo returns no text field).
+fn wmo_desc(code: i64) -> &'static str {
+    match code {
+        0 => "clear sky",
+        1 => "mainly clear",
+        2 => "partly cloudy",
+        3 => "overcast",
+        45 | 48 => "fog",
+        51 => "light drizzle",
+        53 => "drizzle",
+        55 => "dense drizzle",
+        56 | 57 => "freezing drizzle",
+        61 => "light rain",
+        63 => "rain",
+        65 => "heavy rain",
+        66 | 67 => "freezing rain",
+        71 => "light snow",
+        73 => "snow",
+        75 => "heavy snow",
+        77 => "snow grains",
+        80 => "light showers",
+        81 => "showers",
+        82 => "violent showers",
+        85 | 86 => "snow showers",
+        95 => "thunderstorm",
+        96 | 99 => "thunderstorm, hail",
+        _ => "",
+    }
+}
+
+fn json_number(s: &str, key: &str) -> Option<f64> {
+    let rest = s[s.find(key)? + key.len()..].trim_start();
+    let end = rest
+        .find(|c: char| !matches!(c, '0'..='9' | '-' | '+' | '.' | 'e' | 'E'))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn json_array_first(s: &str, key: &str) -> Option<f64> {
+    let rest = s[s.find(key)? + key.len()..].trim_start().strip_prefix('[')?.trim_start();
+    let end = rest
+        .find(|c: char| !matches!(c, '0'..='9' | '-' | '+' | '.' | 'e' | 'E'))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn json_string(s: &str, key: &str) -> Option<String> {
+    let rest = s[s.find(key)? + key.len()..].trim_start().strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Inner text of the object value at `key` (`key` must include the closing
+/// quote and colon, e.g. `"current":`, so `"current_units":` is not matched),
+/// delimited by its matching brace.
+fn json_object<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    let rest = s[s.find(key)? + key.len()..].trim_start().strip_prefix('{')?;
+    let mut depth = 1;
+    for (idx, c) in rest.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Values detected once at startup rather than hardcoded, so the same binary
 /// works on other machines.
 struct HostInfo {
@@ -700,11 +1181,13 @@ struct HostInfo {
 }
 
 impl HostInfo {
-    fn detect() -> HostInfo {
+    /// The GPU name is derived from the already-detected backend rather than
+    /// re-probed, so an eGPU's name matches the card whose stats we report.
+    fn detect(gpu_name: String) -> HostInfo {
         let disk_blockdev = root_blockdev(DISK_MOUNT).unwrap_or_default();
         HostInfo {
             cpu_name: cpu_name(),
-            gpu_name: gpu_name(),
+            gpu_name,
             disk_label: disk_model(&disk_blockdev),
             disk_blockdev,
         }
@@ -717,14 +1200,15 @@ struct State {
     prev_net: (u64, u64),
     prev_net_at: Instant,
     last_fan_rpm: i64,
-    gpu: Option<GpuBusy>,
+    gpu: GpuBackend,
+    weather: WeatherState,
 }
 
 fn build_packets(host: &HostInfo, ec: Option<&Ec>, state: &mut State) -> Vec<(u8, String)> {
     let mut packets = Vec::new();
 
-    let coretemp_hwmon = find_hwmon_by_name("coretemp");
-    let cpu_temp = coretemp_hwmon.as_ref().map(|p| read_temp_c(p, "temp1_input")).unwrap_or(0);
+    let cpu_temp_hwmon = CPU_TEMP_HWMON.iter().find_map(|n| find_hwmon_by_name(n));
+    let cpu_temp = cpu_temp_hwmon.as_ref().map(|p| read_temp_c(p, "temp1_input")).unwrap_or(0);
     let cur_cpu_times = read_cpu_times();
     let cpu_pct = cpu_percent(&state.prev_cpu, &cur_cpu_times);
     state.prev_cpu = cur_cpu_times;
@@ -744,14 +1228,21 @@ fn build_packets(host: &HostInfo, ec: Option<&Ec>, state: &mut State) -> Vec<(u8
         ),
     ));
 
-    // GPU temperature comes from vendor EC register 0x22 -- the same source
-    // the Windows app reads, a genuinely separate sensor that runs ~10-13C
-    // below the CPU package. Utilisation comes from the i915 PMU.
-    let gpu_temp = ec
-        .map(|e| e.temp_c(EC_REG_GPU_TEMP))
-        .filter(|t| *t <= EC_GPU_TEMP_SANITY_MAX)
-        .unwrap_or(cpu_temp);
-    let gpu_pct = state.gpu.as_mut().map(|g| g.percent()).unwrap_or(0);
+    // For the Intel iGPU, temperature comes from vendor EC register 0x22 (the
+    // same source the Windows app reads -- a separate sensor ~10-13C below the
+    // CPU package) and utilisation from the i915 PMU. A discrete eGPU reports
+    // its own temperature and utilisation through its driver instead.
+    let (gpu_temp, gpu_pct) = match &mut state.gpu {
+        GpuBackend::Nvidia => nvidia_temp_usage(),
+        GpuBackend::Amd(a) => (a.temp(), a.usage()),
+        GpuBackend::Intel(busy) => {
+            let temp = ec
+                .map(|e| e.temp_c(EC_REG_GPU_TEMP))
+                .filter(|t| *t <= EC_GPU_TEMP_SANITY_MAX)
+                .unwrap_or(cpu_temp);
+            (temp, busy.as_mut().map(|g| g.percent()).unwrap_or(0))
+        }
+    };
     packets.push((
         CMD_GPU,
         format!("{{GPU:{};Tempr:{gpu_temp};Useage:{gpu_pct}}}", host.gpu_name),
@@ -775,7 +1266,7 @@ fn build_packets(host: &HostInfo, ec: Option<&Ec>, state: &mut State) -> Vec<(u8
     let used_disk_gb = (used_bytes / (1024 * 1024 * 1024)) as i64;
     let total_disk_gb = (total_bytes / (1024 * 1024 * 1024)) as i64;
     let disk_pct = if total_bytes > 0 { (used_bytes * 100 / total_bytes) as i64 } else { 0 };
-    let disk_temp = nvme_temp_c(&host.disk_blockdev);
+    let disk_temp = disk_temp_c(&host.disk_blockdev);
     packets.push((
         CMD_DISK,
         format!(
@@ -785,13 +1276,7 @@ fn build_packets(host: &HostInfo, ec: Option<&Ec>, state: &mut State) -> Vec<(u8
     ));
 
     let d = now_local();
-    packets.push((
-        CMD_DATE,
-        format!(
-            "Date:{:02}/{:02}/{:02};Time:{:02}:{:02}:{:02};Week:{}",
-            d.year % 100, d.month, d.day, d.hour, d.minute, d.second, d.win_dow
-        ),
-    ));
+    packets.push((CMD_DATE, format_date_packet(&d, state.weather.current())));
 
     // Fan RPM and network rates share one packet. The original app discards
     // implausible fan readings (the two register bytes are read in separate
@@ -837,21 +1322,24 @@ fn build_packets(host: &HostInfo, ec: Option<&Ec>, state: &mut State) -> Vec<(u8
 /// Lets the output be inspected without hardware; run it as root to include
 /// the EC and PMU derived fields.
 fn dump_once() {
-    let host = HostInfo::detect();
+    let gpu = GpuBackend::detect();
+    let host = HostInfo::detect(gpu.name());
     println!("cpu_name      = {}", host.cpu_name);
     println!("gpu_name      = {}", host.gpu_name);
+    println!("gpu_backend   = {}", gpu.label());
     println!("disk_label    = {}", host.disk_label);
     println!("disk_blockdev = {}", host.disk_blockdev);
     let ec = Ec::open();
     println!("ec            = {}", if ec.is_some() { "open" } else { "unavailable (needs root)" });
-    let gpu = GpuBusy::open();
-    println!("gpu pmu       = {}", if gpu.is_some() { "open" } else { "unavailable (needs root)" });
+    let weather = WeatherState::from_env();
+    println!("weather       = {}", weather.mode_label());
     let mut state = State {
         prev_cpu: read_cpu_times(),
         prev_net: read_net_bytes(),
         prev_net_at: Instant::now(),
         last_fan_rpm: 0,
         gpu,
+        weather,
     };
     std::thread::sleep(Duration::from_millis(500));
     println!("\npackets:");
@@ -866,21 +1354,25 @@ fn main() {
         return;
     }
 
-    let host = HostInfo::detect();
+    let gpu = GpuBackend::detect();
+    eprintln!("gpu backend: {}", gpu.label());
+    let host = HostInfo::detect(gpu.name());
     let ec = Ec::open();
     if ec.is_none() {
         eprintln!("cannot open /dev/port (needs root) -- fan RPM and EC temps will read 0");
     }
-    let gpu = GpuBusy::open();
-    if gpu.is_none() {
+    if matches!(gpu, GpuBackend::Intel(None)) {
         eprintln!("i915 perf PMU unavailable -- GPU usage will read 0");
     }
+    let weather = WeatherState::from_env();
+    eprintln!("weather: {}", weather.mode_label());
     let mut state = State {
         prev_cpu: read_cpu_times(),
         prev_net: read_net_bytes(),
         prev_net_at: Instant::now(),
         last_fan_rpm: 0,
         gpu,
+        weather,
     };
     let mut fd: Option<RawFd> = None;
     let mut input: Vec<u8> = Vec::new();
@@ -890,8 +1382,12 @@ fn main() {
     // between writes so a volume drag is applied without waiting a full cycle.
     // A drag emits many frames, so only act when the value actually changes --
     // otherwise every frame would fork a wpctl process.
-    let pump = |fd: RawFd, input: &mut Vec<u8>, last: &mut Option<u8>| {
-        input.extend_from_slice(&read_available(fd));
+    // Returns true if any bytes arrived, which the caller uses as a liveness
+    // signal for the link.
+    let pump = |fd: RawFd, input: &mut Vec<u8>, last: &mut Option<u8>| -> bool {
+        let bytes = read_available(fd);
+        let got = !bytes.is_empty();
+        input.extend_from_slice(&bytes);
         for (cmd, values) in parse_device_frames(input) {
             if cmd == DEV_CMD_VOLUME {
                 if let Some(&v) = values.first() {
@@ -902,7 +1398,10 @@ fn main() {
                 }
             }
         }
+        got
     };
+
+    let mut last_rx = Instant::now();
 
     loop {
         if fd.is_none() {
@@ -911,6 +1410,7 @@ fn main() {
                     Ok(f) => {
                         fd = Some(f);
                         input.clear();
+                        last_rx = Instant::now();
                     }
                     Err(e) => {
                         eprintln!("failed to open {path}: {e}");
@@ -937,7 +1437,9 @@ fn main() {
                 broke = true;
                 break;
             }
-            pump(fd.unwrap(), &mut input, &mut last_volume);
+            if pump(fd.unwrap(), &mut input, &mut last_volume) {
+                last_rx = Instant::now();
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         if broke {
@@ -947,10 +1449,20 @@ fn main() {
 
         // Service input for the remainder of the cycle, so the whole loop
         // lands on UPDATE_INTERVAL rather than interval + time already spent.
+        // A healthy panel polls constantly; prolonged silence means the link
+        // died without a write error (suspend/resume, USB re-enumeration), so
+        // reopen the port.
         let deadline = cycle_start + UPDATE_INTERVAL;
         while Instant::now() < deadline {
-            pump(fd.unwrap(), &mut input, &mut last_volume);
+            if pump(fd.unwrap(), &mut input, &mut last_volume) {
+                last_rx = Instant::now();
+            }
             std::thread::sleep(Duration::from_millis(25));
+        }
+        if last_rx.elapsed() > LINK_SILENCE {
+            eprintln!("no panel traffic for {}s -- reopening port", LINK_SILENCE.as_secs());
+            unsafe { libc::close(fd.unwrap()) };
+            fd = None;
         }
     }
 }
@@ -1065,6 +1577,117 @@ mod tests {
         assert_eq!(format_rate(1_024_000.0), "1.0M/s");
         assert_eq!(format_rate(1_048_575_999.0), "1000.0M/s");
         assert_eq!(format_rate(1_048_576_000.0), "1.0G/s");
+    }
+
+    #[test]
+    fn nvidia_temp_usage_is_parsed() {
+        // nvidia-smi csv,noheader,nounits: "temperature.gpu, utilization.gpu"
+        assert_eq!(parse_nvidia_temp_usage("45, 12"), (45, 12));
+        assert_eq!(parse_nvidia_temp_usage("60,100"), (60, 100));
+        // a torn/short line must not panic
+        assert_eq!(parse_nvidia_temp_usage(""), (0, 0));
+        assert_eq!(parse_nvidia_temp_usage("55"), (55, 0));
+    }
+
+    #[test]
+    fn lspci_device_name_prefers_bracketed_marketing_name() {
+        let line = r#"03:00.0 "VGA compatible controller" "Advanced Micro Devices, Inc. [AMD/ATI]" "Navi 33 [Radeon RX 7600]" -r00 "#;
+        assert_eq!(parse_lspci_device(line).as_deref(), Some("Radeon RX 7600"));
+        // no brackets -> "<short vendor> <device>"
+        let plain = r#"00:02.0 "Display controller" "Intel Corporation" "Some iGPU""#;
+        assert_eq!(parse_lspci_device(plain).as_deref(), Some("Intel Some iGPU"));
+    }
+
+    // ---- weather / date tile ------------------------------------------
+
+    fn sample_date() -> DateParts {
+        DateParts { year: 2025, month: 9, day: 15, hour: 14, minute: 22, second: 10, win_dow: 1 }
+    }
+
+    #[test]
+    fn date_packet_without_weather_sends_empty_block() {
+        assert_eq!(
+            format_date_packet(&sample_date(), None),
+            "{Date:2025/09/15;Time:14:22:10;Week:1;Weather:;TemprLo:,TemprHi:,Zone:,Desc:}"
+        );
+    }
+
+    #[test]
+    fn date_packet_with_weather_matches_reference_format() {
+        let w = Weather { code: 4, lo: 12, hi: 27, zone: "Denver,US".into(), desc: "broken clouds".into() };
+        assert_eq!(
+            format_date_packet(&sample_date(), Some(&w)),
+            "{Date:2025/09/15;Time:14:22:10;Week:1;Weather:4;TemprLo:12,TemprHi:27,Zone:Denver,US,Desc:broken clouds}"
+        );
+    }
+
+    #[test]
+    fn wmo_maps_day_night_and_unknown() {
+        assert_eq!(wmo_to_panel(0, true), 1); // clear, day
+        assert_eq!(wmo_to_panel(0, false), 3); // clear, night
+        assert_eq!(wmo_to_panel(95, true), 11); // thunderstorm
+        assert_eq!(wmo_to_panel(96, true), 16); // thunderstorm w/ hail
+        assert_eq!(wmo_to_panel(12345, true), 9); // unknown -> overcast
+    }
+
+    #[test]
+    fn open_meteo_reads_current_then_daily() {
+        // *_units blocks come first and their STRING values must not be read as
+        // the data (this shadowing was a real bug).
+        let json = r#"{"latitude":39.7,"longitude":-104.9,
+          "current_units":{"weather_code":"wmo code","is_day":""},
+          "current":{"time":"t","temperature_2m":18.4,"weather_code":3,"is_day":1},
+          "daily_units":{"temperature_2m_max":"°C","temperature_2m_min":"°C"},
+          "daily":{"time":["d"],"weather_code":[61],"temperature_2m_max":[26.6],"temperature_2m_min":[11.2]}}"#;
+        let w = parse_open_meteo(json, "Denver,US").expect("parsed");
+        assert_eq!(w.code, 9, "current weather_code 3 (overcast), not daily's 61");
+        assert_eq!((w.lo, w.hi), (11, 27), "rounded from daily min/max");
+        assert_eq!(w.zone, "Denver,US");
+        assert_eq!(w.desc, "overcast");
+    }
+
+    #[test]
+    fn open_meteo_night_clear_uses_night_icon() {
+        let json = r#"{"current":{"weather_code":0,"is_day":0},
+          "daily":{"temperature_2m_max":[5.0],"temperature_2m_min":[-2.4]}}"#;
+        let w = parse_open_meteo(json, "z").expect("parsed");
+        assert_eq!(w.code, 3, "clear at night");
+        assert_eq!((w.lo, w.hi), (-2, 5));
+    }
+
+    #[test]
+    fn geocode_parses_literal_lat_lon() {
+        let loc = geocode("39.7392,-104.9903").expect("literal coords");
+        assert!((loc.lat - 39.7392).abs() < 1e-6);
+        assert!((loc.lon - (-104.9903)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ipapi_result_is_parsed() {
+        let json = r#"{"status":"success","countryCode":"GB","city":"Northampton","lat":52.25,"lon":-0.8833}"#;
+        let loc = parse_ipapi(json).expect("geolocated");
+        assert_eq!((loc.lat, loc.lon), (52.25, -0.8833));
+        assert_eq!(loc.zone, "Northampton,GB");
+    }
+
+    #[test]
+    fn ipapi_failure_status_is_rejected() {
+        assert!(parse_ipapi(r#"{"status":"fail","message":"private range"}"#).is_none());
+    }
+
+    #[test]
+    fn geocode_result_is_parsed() {
+        let json = r#"{"results":[{"name":"Denver","latitude":39.74,"longitude":-104.98,"country_code":"US"}]}"#;
+        let loc = parse_geocode(json).expect("geocoded");
+        assert_eq!((loc.lat, loc.lon), (39.74, -104.98));
+        assert_eq!(loc.zone, "Denver,US");
+    }
+
+    #[test]
+    fn zone_and_desc_are_sanitized() {
+        // semicolons would break the ; -delimited payload; non-ascii -> '?'
+        assert_eq!(sanitize("a;b"), "a,b");
+        assert_eq!(sanitize("Zürich"), "Z?rich");
     }
 
     // ---- /proc parsing -------------------------------------------------

@@ -5,7 +5,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: Nikhil Pagote <nikhil.pagote@gmail.com>
 Depends: pciutils
-Recommends: wireplumber
+Recommends: wireplumber, curl
 Description: Front-panel LCD driver for Minisforum/AtomMan mini PCs
  Linux replacement for the Windows-only SCC front-panel LCD driver.
  Streams live CPU, GPU, memory, SSD, fan RPM and network transfer rates

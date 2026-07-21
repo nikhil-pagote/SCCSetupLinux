@@ -1,7 +1,8 @@
 [package]
 name = "scc-lcd-daemon"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 libc = "0.2"

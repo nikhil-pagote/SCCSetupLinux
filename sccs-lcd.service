@@ -5,6 +5,8 @@ After=multi-user.target
 [Service]
 # Runs as root: fan RPM is read from the vendor embedded controller through
 # direct port I/O on /dev/port, which needs CAP_SYS_RAWIO.
+# Optional weather config (OW_LOCATION etc.); the leading - makes it optional.
+EnvironmentFile=-/etc/default/scc-lcd
 ExecStart=/usr/bin/scc-lcd-daemon
 Restart=always
 RestartSec=2

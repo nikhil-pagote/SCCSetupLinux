@@ -79,6 +79,43 @@ Installing:
 No further setup is needed; the panel should start showing live stats within
 a second or two.
 
+## Installing from source (Arch, Fedora, other non-Debian distros)
+
+There is no `.deb` for non-Debian distros, but the daemon is a single static-ish
+binary with no runtime dependencies beyond `lspci` and `wpctl`, so a manual
+install is a handful of copies. This does by hand exactly what the package's
+`postinst` does.
+
+```bash
+cargo build --release
+
+# 1. binary — the service unit expects it at /usr/bin/scc-lcd-daemon
+sudo install -m755 target/release/scc-lcd-daemon /usr/bin/scc-lcd-daemon
+
+# 2. systemd unit and udev rule
+sudo install -m644 sccs-lcd.service      /etc/systemd/system/sccs-lcd.service
+sudo install -m644 99-sccs-lcd.rules     /etc/udev/rules.d/99-sccs-lcd.rules
+
+# 3. optional weather/config env file (safe to skip)
+sudo install -m644 packaging/scc-lcd.default /etc/default/scc-lcd
+
+# 4. load the udev rule and start the service
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo systemctl daemon-reload
+sudo systemctl enable --now sccs-lcd.service
+```
+
+Runtime tools differ by distro — install the equivalents of `pciutils`
+(`lspci`), `wireplumber` (`wpctl`), and, for weather, `curl` with your package
+manager. To uninstall, reverse it:
+
+```bash
+sudo systemctl disable --now sccs-lcd.service
+sudo rm /usr/bin/scc-lcd-daemon /etc/systemd/system/sccs-lcd.service \
+        /etc/udev/rules.d/99-sccs-lcd.rules /etc/default/scc-lcd
+sudo systemctl daemon-reload && sudo udevadm control --reload-rules
+```
+
 ## Using it
 
 The daemon runs continuously as a systemd service once installed — there's
@@ -121,3 +158,8 @@ sudo apt remove scc-lcd-daemon
 ```
 
 This stops and disables the service and removes the udev rule.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The reverse-engineered vendor protocol is noted
+in [NOTICE](NOTICE).

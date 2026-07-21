@@ -1,0 +1,10 @@
+Third-party attributions
+=========================
+
+Minisforum / AtomMan (SCCS.exe)
+-------------------------------
+The panel serial protocol and the vendor embedded-controller register map were
+reverse-engineered from the vendor's Windows driver (SCCSetup.exe -> SCCS.exe)
+for interoperability with hardware the user owns. No vendor code is included or
+redistributed in this repository; this is an original, independent
+reimplementation.
