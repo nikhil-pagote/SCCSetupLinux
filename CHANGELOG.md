@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 semantic versioning. The version is the single source of truth in `Cargo.toml`.
 
+## [1.9.1] - 2026-07-22
+
+### Fixed
+- Weather no longer stays blank for up to 10 minutes after boot when the network
+  comes up late (e.g. Wi-Fi that connects only after login). Until the first
+  successful fetch the daemon now retries every 30 s instead of waiting the full
+  refresh interval; once it has a value it reverts to the normal refresh.
+
 ## [1.9.0] - 2026-07-21
 
 ### Added
@@ -52,6 +60,7 @@ semantic versioning. The version is the single source of truth in `Cargo.toml`.
   rates to the front panel, and applies volume changes from its touch control.
   Packaged as a `.deb` with a systemd unit and udev rule.
 
+[1.9.1]: https://github.com/nikhil-pagote/SCCSetupLinux/releases/tag/v1.9.1
 [1.9.0]: https://github.com/nikhil-pagote/SCCSetupLinux/releases/tag/v1.9.0
 [1.8.0]: https://github.com/nikhil-pagote/SCCSetupLinux/releases/tag/v1.8.0
 [1.7.0]: https://github.com/nikhil-pagote/SCCSetupLinux/releases/tag/v1.7.0

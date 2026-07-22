@@ -863,6 +863,10 @@ fn now_local() -> DateParts {
 // service (ip-api.com); OW_LOCATION=off avoids any such call.
 
 const WEATHER_REFRESH_DEFAULT: u64 = 600;
+// Until the first successful fetch, retry this often instead of waiting the full
+// refresh -- so weather appears soon after the network comes up (e.g. Wi-Fi that
+// connects well after boot) rather than staying blank for up to `refresh`.
+const WEATHER_RETRY: Duration = Duration::from_secs(30);
 
 struct Weather {
     code: i64, // panel weather-icon code (1..40)
@@ -945,14 +949,17 @@ impl WeatherState {
         }
     }
 
-    /// Latest weather, refetched at most once per `refresh`. Resolves the
-    /// location lazily, retrying each refresh until it succeeds. Returns the
-    /// previous value between refreshes and None when disabled or never fetched.
+    /// Latest weather, refetched at most once per `refresh` once we have a
+    /// value -- but retried every `WEATHER_RETRY` until that first success, so a
+    /// network that arrives late (Wi-Fi after boot) is picked up quickly rather
+    /// than leaving the tile blank for up to `refresh`. Returns the previous
+    /// value between refreshes and None when disabled or never fetched.
     fn current(&mut self) -> Option<&Weather> {
         if matches!(self.mode, LocMode::Off) {
             return None;
         }
-        let stale = self.fetched_at.map(|t| t.elapsed() >= self.refresh).unwrap_or(true);
+        let interval = if self.last.is_some() { self.refresh } else { WEATHER_RETRY };
+        let stale = self.fetched_at.map(|t| t.elapsed() >= interval).unwrap_or(true);
         if stale {
             if self.located.is_none() {
                 self.located = match &self.mode {
